@@ -164,10 +164,6 @@ class LambdaHandler(object):
 
             zip_path = s3.Object(remote_bucket, remote_file)
 
-            # Unzip contents to project folder
-            with zipfile.ZipFile(zip_path, 'r') as z:
-                z.extractall(path=project_folder)
-
             with io.BytesIO(zip_path.get()['Body'].read()) as tf:
                 tf.seek(0) # Rewind the file
                 # Read zip contents and extract them to the project folder
