@@ -1,5 +1,9 @@
 # Zappa Changelog
 
+## 0.48.0
+
+* Add support for Python 3.7
+
 ## 0.47.1
 * Handle accounts with more than 100 domains in route 53
 * Force requests upgrade to 2.20.0 for compatibility with urllib3 1.24
