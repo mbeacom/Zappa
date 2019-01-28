@@ -4,6 +4,7 @@
 
 * Add support for Python 3.7 (https://github.com/Miserlou/Zappa/pull/1762)
 * Add PIP_TIMEOUT environment variable (https://github.com/Miserlou/Zappa/pull/1766/)
+* Add support for Lambda layers (https://github.com/Miserlou/Zappa/pull/1752) - Fixes #1716
 
 ## 0.47.1
 * Handle accounts with more than 100 domains in route 53
