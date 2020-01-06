@@ -173,27 +173,35 @@ ATTACH_POLICY = """{
 API_GATEWAY_REGIONS = ['us-east-1', 'us-east-2',
                        'us-west-1', 'us-west-2',
                        'eu-central-1',
+                       'eu-north-1',
                        'eu-west-1', 'eu-west-2', 'eu-west-3',
+                       'eu-north-1',
                        'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3',
                        'ap-southeast-1', 'ap-southeast-2',
+                       'ap-east-1',
                        'ap-south-1',
                        'ca-central-1',
                        'cn-north-1',
                        'cn-northwest-1',
-                       'sa-east-1']
+                       'sa-east-1',
+                       'us-gov-east-1', 'us-gov-west-1']
 
 # Latest list: https://docs.aws.amazon.com/general/latest/gr/rande.html#lambda_region
 LAMBDA_REGIONS = ['us-east-1', 'us-east-2',
                   'us-west-1', 'us-west-2',
                   'eu-central-1',
+                  'eu-north-1',
                   'eu-west-1', 'eu-west-2', 'eu-west-3',
+                  'eu-north-1',
                   'ap-northeast-1', 'ap-northeast-2', 'ap-northeast-3',
                   'ap-southeast-1', 'ap-southeast-2',
+                  'ap-east-1',
                   'ap-south-1',
                   'ca-central-1',
                   'cn-north-1',
                   'cn-northwest-1',
                   'sa-east-1',
+                  'us-gov-east-1',
                   'us-gov-west-1']
 
 # We never need to include these.
@@ -203,6 +211,12 @@ ZIP_EXCLUDES = [
     '*.exe', '*.DS_Store', '*.Python', '*.git', '.git/*', '*.zip', '*.tar.gz',
     '*.hg', 'pip', 'docutils*', 'setuputils*', '__pycache__/*'
 ]
+
+# When using ALB as an event source for Lambdas, we need to create an alias
+# to ensure that, on zappa update, the ALB doesn't lose permissions to access
+# the Lambda.
+# See: https://github.com/Miserlou/Zappa/pull/1730
+ALB_LAMBDA_ALIAS = 'current-alb-version'
 
 ##
 # Classes
@@ -270,8 +284,10 @@ class Zappa(object):
 
         if self.runtime == 'python2.7':
             self.manylinux_wheel_file_suffix = 'cp27mu-manylinux1_x86_64.whl'
-        else:
+        elif self.runtime == 'python3.6':
             self.manylinux_wheel_file_suffix = 'cp36m-manylinux1_x86_64.whl'
+        else:
+            self.manylinux_wheel_file_suffix = 'cp37m-manylinux1_x86_64.whl'
 
         self.endpoint_urls = endpoint_urls
         self.xray_tracing = xray_tracing
@@ -295,6 +311,7 @@ class Zappa(object):
             # Initialize clients
             self.s3_client = self.boto_client('s3')
             self.lambda_client = self.boto_client('lambda', config=long_config)
+            self.elbv2_client = self.boto_client('elbv2')
             self.events_client = self.boto_client('events')
             self.apigateway_client = self.boto_client('apigateway')
             # AWS ACM certificates need to be created from us-east-1 to be used by API gateway
@@ -815,7 +832,7 @@ class Zappa(object):
         Downloads a given url in chunks and writes to the provided stream (can be any io stream).
         Displays the progress bar for the download.
         """
-        resp = requests.get(url, timeout=os.environ.get('PIP_TIMEOUT', 2), stream=True)
+        resp = requests.get(url, timeout=float(os.environ.get('PIP_TIMEOUT', 2)), stream=True)
         resp.raw.decode_content = True
 
         progress = tqdm(unit="B", unit_scale=True, total=int(resp.headers.get('Content-Length', 0)), disable=disable_progress)
@@ -883,7 +900,7 @@ class Zappa(object):
         else:
             url = 'https://pypi.python.org/pypi/{}/json'.format(package_name)
             try:
-                res = requests.get(url, timeout=os.environ.get('PIP_TIMEOUT', 1.5))
+                res = requests.get(url, timeout=float(os.environ.get('PIP_TIMEOUT', 1.5)))
                 data = res.json()
             except Exception as e: # pragma: no cover
                 return None
@@ -1034,7 +1051,8 @@ class Zappa(object):
                                 aws_kms_key_arn=None,
                                 xray_tracing=False,
                                 local_zip=None,
-                                layers=None
+                                use_alb=False,
+                                layers=None,
                             ):
         """
         Given a bucket and key (or a local path) of a valid Lambda-zip, a function name and a handler, register that Lambda function.
@@ -1083,6 +1101,19 @@ class Zappa(object):
         response = self.lambda_client.create_function(**kwargs)
 
         resource_arn = response['FunctionArn']
+        version = response['Version']
+
+        # If we're using an ALB, let's create an alias mapped to the newly
+        # created function. This allows clean, no downtime association when
+        # using application load balancers as an event source.
+        # See: https://github.com/Miserlou/Zappa/pull/1730
+        #      https://github.com/Miserlou/Zappa/issues/1823
+        if use_alb:
+            self.lambda_client.create_alias(
+                FunctionName=resource_arn,
+                FunctionVersion=version,
+                Name=ALB_LAMBDA_ALIAS,
+            )
 
         if self.tags:
             self.lambda_client.tag_resource(Resource=resource_arn, Tags=self.tags)
@@ -1107,6 +1138,32 @@ class Zappa(object):
             kwargs['S3Key'] = s3_key
 
         response = self.lambda_client.update_function_code(**kwargs)
+        resource_arn = response['FunctionArn']
+        version = response['Version']
+
+        # If the lambda has an ALB alias, let's update the alias
+        # to point to the newest version of the function. We have to use a GET
+        # here, as there's no HEAD-esque call to retrieve metadata about a
+        # function alias.
+        # Related: https://github.com/Miserlou/Zappa/pull/1730
+        #          https://github.com/Miserlou/Zappa/issues/1823
+        try:
+            response = self.lambda_client.get_alias(
+                FunctionName=function_name,
+                Name=ALB_LAMBDA_ALIAS,
+            )
+            alias_exists = True
+        except botocore.exceptions.ClientError as e:  # pragma: no cover
+            if "ResourceNotFoundException" not in e.response["Error"]["Code"]:
+                raise e
+            alias_exists = False
+
+        if alias_exists:
+            self.lambda_client.update_alias(
+                FunctionName=function_name,
+                FunctionVersion=version,
+                Name=ALB_LAMBDA_ALIAS,
+            )
 
         if num_revisions:
             # Find the existing revision IDs for the given function
@@ -1124,7 +1181,7 @@ class Zappa(object):
             for version in versions_in_lambda[::-1][num_revisions:]:
                 self.lambda_client.delete_function(FunctionName=function_name,Qualifier=version)
 
-        return response['FunctionArn']
+        return resource_arn
 
     def update_lambda_configuration(    self,
                                         lambda_arn,
@@ -1273,6 +1330,211 @@ class Zappa(object):
         )
 
     ##
+    # Application load balancer
+    ##
+
+    def deploy_lambda_alb(  self,
+                            lambda_arn,
+                            lambda_name,
+                            alb_vpc_config,
+                            timeout
+                         ):
+        """
+        The `zappa deploy` functionality for ALB infrastructure.
+        """
+        if not alb_vpc_config:
+            raise EnvironmentError('When creating an ALB, alb_vpc_config must be filled out in zappa_settings.')
+        if 'SubnetIds' not in alb_vpc_config:
+            raise EnvironmentError('When creating an ALB, you must supply two subnets in different availability zones.')
+        if 'SecurityGroupIds' not in alb_vpc_config:
+            alb_vpc_config["SecurityGroupIds"] = []
+        if not alb_vpc_config.get('CertificateArn'):
+            raise EnvironmentError('When creating an ALB, you must supply a CertificateArn for the HTTPS listener.')
+        print("Deploying ALB infrastructure...")
+
+        # Create load balancer
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.create_load_balancer
+        kwargs = dict(
+            Name=lambda_name,
+            Subnets=alb_vpc_config["SubnetIds"],
+            SecurityGroups=alb_vpc_config["SecurityGroupIds"],
+            # TODO: Scheme can also be "internal" we need to add a new option for this.
+            Scheme="internet-facing",
+            # TODO: Tags might be a useful means of stock-keeping zappa-generated assets.
+            #Tags=[],
+            Type="application",
+            # TODO: can be ipv4 or dualstack (for ipv4 and ipv6) ipv4 is required for internal Scheme.
+            IpAddressType="ipv4"
+        )
+        response = self.elbv2_client.create_load_balancer(**kwargs)
+        if not(response["LoadBalancers"]) or len(response["LoadBalancers"]) != 1:
+            raise EnvironmentError("Failure to create application load balancer. Response was in unexpected format. Response was: {}".format(repr(response)))
+        if response["LoadBalancers"][0]['State']['Code'] == 'failed':
+            raise EnvironmentError("Failure to create application load balancer. Response reported a failed state: {}".format(response["LoadBalancers"][0]['State']['Reason']))
+        load_balancer_arn = response["LoadBalancers"][0]["LoadBalancerArn"]
+        load_balancer_dns = response["LoadBalancers"][0]["DNSName"]
+        load_balancer_vpc = response["LoadBalancers"][0]["VpcId"]
+        waiter = self.elbv2_client.get_waiter('load_balancer_available')
+
+        # Match the lambda timeout on the load balancer.
+        self.elbv2_client.modify_load_balancer_attributes(
+            LoadBalancerArn=load_balancer_arn,
+            Attributes=[{
+                'Key': 'idle_timeout.timeout_seconds',
+                'Value': str(timeout)
+            }]
+        )
+
+        # Create/associate target group.
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.create_target_group
+        kwargs = dict(
+            Name=lambda_name,
+            TargetType="lambda",
+            # TODO: Add options for health checks
+        )
+
+        response = self.elbv2_client.create_target_group(**kwargs)
+        if not(response["TargetGroups"]) or len(response["TargetGroups"]) != 1:
+            raise EnvironmentError("Failure to create application load balancer target group. Response was in unexpected format. Response was: {}".format(repr(response)))
+        target_group_arn = response["TargetGroups"][0]["TargetGroupArn"]
+
+        # Enable multi-value headers by default.
+        response = self.elbv2_client.modify_target_group_attributes(
+            TargetGroupArn=target_group_arn,
+            Attributes=[
+                {
+                    'Key': 'lambda.multi_value_headers.enabled',
+                    'Value': 'true'
+                },
+            ]
+        )
+
+        # Allow execute permissions from target group to lambda.
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#Lambda.Client.add_permission
+        kwargs = dict(
+            Action="lambda:InvokeFunction",
+            FunctionName="{}:{}".format(lambda_arn, ALB_LAMBDA_ALIAS),
+            Principal="elasticloadbalancing.amazonaws.com",
+            SourceArn=target_group_arn,
+            StatementId=lambda_name
+        )
+        response = self.lambda_client.add_permission(**kwargs)
+
+        # Register target group to lambda association.
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.register_targets
+        kwargs = dict(
+            TargetGroupArn=target_group_arn,
+            Targets=[{"Id": "{}:{}".format(lambda_arn, ALB_LAMBDA_ALIAS)}]
+        )
+        response = self.elbv2_client.register_targets(**kwargs)
+
+        # Bind listener to load balancer with default rule to target group.
+        # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.create_listener
+        kwargs = dict(
+            # TODO: Listeners support custom ssl certificates (Certificates). For now we leave this default.
+            Certificates=[{"CertificateArn": alb_vpc_config['CertificateArn']}],
+            DefaultActions=[{
+                "Type": "forward",
+                "TargetGroupArn": target_group_arn,
+            }],
+            LoadBalancerArn=load_balancer_arn,
+            Protocol="HTTPS",
+            # TODO: Add option for custom ports
+            Port=443,
+            # TODO: Listeners support custom ssl security policy (SslPolicy). For now we leave this default.
+        )
+        response = self.elbv2_client.create_listener(**kwargs)
+        print("ALB created with DNS: {}".format(load_balancer_dns))
+        print("Note it may take several minutes for load balancer to become available.")
+
+    def undeploy_lambda_alb(self, lambda_name):
+        """
+        The `zappa undeploy` functionality for ALB infrastructure.
+        """
+        print("Undeploying ALB infrastructure...")
+
+        # Locate and delete alb/lambda permissions
+        try:
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#Lambda.Client.remove_permission
+            self.lambda_client.remove_permission(
+                FunctionName=lambda_name,
+                StatementId=lambda_name
+            )
+        except botocore.exceptions.ClientError as e: # pragma: no cover
+            if "ResourceNotFoundException" in e.response["Error"]["Code"]:
+                pass
+            else:
+                raise e
+
+        # Locate and delete load balancer
+        try:
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.describe_load_balancers
+            response = self.elbv2_client.describe_load_balancers(
+                Names=[lambda_name]
+            )
+            if not(response["LoadBalancers"]) or len(response["LoadBalancers"]) > 1:
+                raise EnvironmentError("Failure to locate/delete ALB named [{}]. Response was: {}".format(lambda_name, repr(response)))
+            load_balancer_arn = response["LoadBalancers"][0]["LoadBalancerArn"]
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.describe_listeners
+            response = self.elbv2_client.describe_listeners(LoadBalancerArn=load_balancer_arn)
+            if not(response["Listeners"]):
+                print('No listeners found.')
+            elif len(response["Listeners"]) > 1:
+                raise EnvironmentError("Failure to locate/delete listener for ALB named [{}]. Response was: {}".format(lambda_name, repr(response)))
+            else:
+                listener_arn = response["Listeners"][0]["ListenerArn"]
+                # Remove the listener. This explicit deletion of the listener seems necessary to avoid ResourceInUseExceptions when deleting target groups.
+                # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.delete_listener
+                response = self.elbv2_client.delete_listener(ListenerArn=listener_arn)
+            # Remove the load balancer and wait for completion
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.delete_load_balancer
+            response = self.elbv2_client.delete_load_balancer(LoadBalancerArn=load_balancer_arn)
+            waiter = self.elbv2_client.get_waiter('load_balancers_deleted')
+            print('Waiting for load balancer [{}] to be deleted..'.format(lambda_name))
+            waiter.wait(LoadBalancerArns=[load_balancer_arn], WaiterConfig={"Delay": 3})
+        except botocore.exceptions.ClientError as e: # pragma: no cover
+            print(e.response["Error"]["Code"])
+            if "LoadBalancerNotFound" in e.response["Error"]["Code"]:
+                pass
+            else:
+                raise e
+
+        # Locate and delete target group
+        try:
+            # Locate the lambda ARN
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/lambda.html#Lambda.Client.get_function
+            response = self.lambda_client.get_function(FunctionName=lambda_name)
+            lambda_arn = response["Configuration"]["FunctionArn"]
+            # Locate the target group ARN
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.describe_target_groups
+            response = self.elbv2_client.describe_target_groups(Names=[lambda_name])
+            if not(response["TargetGroups"]) or len(response["TargetGroups"]) > 1:
+                raise EnvironmentError("Failure to locate/delete ALB target group named [{}]. Response was: {}".format(lambda_name, repr(response)))
+            target_group_arn = response["TargetGroups"][0]["TargetGroupArn"]
+            # Deregister targets and wait for completion
+            self.elbv2_client.deregister_targets(
+                TargetGroupArn=target_group_arn,
+                Targets=[{"Id": lambda_arn}]
+            )
+            waiter = self.elbv2_client.get_waiter('target_deregistered')
+            print('Waiting for target [{}] to be deregistered...'.format(lambda_name))
+            waiter.wait(
+                TargetGroupArn=target_group_arn,
+                Targets=[{"Id": lambda_arn}],
+                WaiterConfig={"Delay": 3}
+            )
+            # Remove the target group
+            # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/elbv2.html#ElasticLoadBalancingv2.Client.delete_target_group
+            self.elbv2_client.delete_target_group(TargetGroupArn=target_group_arn)
+        except botocore.exceptions.ClientError as e: # pragma: no cover
+            print(e.response["Error"]["Code"])
+            if "TargetGroupNotFound" in e.response["Error"]["Code"]:
+                pass
+            else:
+                raise e
+
+
+    ##
     # API Gateway
     ##
 
@@ -1283,7 +1545,8 @@ class Zappa(object):
                                     authorization_type='NONE',
                                     authorizer=None,
                                     cors_options=None,
-                                    description=None
+                                    description=None,
+                                    endpoint_configuration=None
                                 ):
         """
         Create the API Gateway for this Zappa deployment.
@@ -1296,9 +1559,12 @@ class Zappa(object):
         if not description:
             description = 'Created automatically by Zappa.'
         restapi.Description = description
+        endpoint_configuration = [] if endpoint_configuration is None else endpoint_configuration
         if self.boto_session.region_name == "us-gov-west-1":
+            endpoint_configuration.append("REGIONAL")
+        if endpoint_configuration:
             endpoint = troposphere.apigateway.EndpointConfiguration()
-            endpoint.Types = ["REGIONAL"]
+            endpoint.Types = list(set(endpoint_configuration))
             restapi.EndpointConfiguration = endpoint
         if self.apigateway_policy:
             restapi.Policy = json.loads(self.apigateway_policy)
@@ -1852,7 +2118,8 @@ class Zappa(object):
                                 iam_authorization,
                                 authorizer,
                                 cors_options=None,
-                                description=None
+                                description=None,
+                                endpoint_configuration=None
                             ):
         """
         Build the entire CF stack.
@@ -1883,7 +2150,8 @@ class Zappa(object):
                                             authorization_type=auth_type,
                                             authorizer=authorizer,
                                             cors_options=cors_options,
-                                            description=description
+                                            description=description,
+                                            endpoint_configuration=endpoint_configuration
                                         )
         return self.cf_template
 
@@ -2186,7 +2454,7 @@ class Zappa(object):
             return
         base_path_mappings = self.apigateway_client.get_base_path_mappings(domainName=domain_name)
         found = False
-        for base_path_mapping in base_path_mappings['items']:
+        for base_path_mapping in base_path_mappings.get('items', []):
             if base_path_mapping['restApiId'] == api_id and base_path_mapping['stage'] == stage:
                 found = True
                 if base_path_mapping['basePath'] != base_path:
@@ -2204,7 +2472,7 @@ class Zappa(object):
                 restApiId=api_id,
                 stage=stage
             )
-        
+
     def get_all_zones(self):
         """Same behaviour of list_host_zones, but transparently handling pagination."""
         zones = {'HostedZones': []}
